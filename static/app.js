@@ -314,11 +314,22 @@ document.getElementById("btn-resume").addEventListener("click", async () => {
 
 document.getElementById("btn-download-approved").addEventListener("click", async () => {
   if (!currentJobId) return;
+  const btn = document.getElementById("btn-download-approved");
+  btn.disabled = true;
+  btn.textContent = "Downloading...";
   try {
-    await fetch(`/api/jobs/${currentJobId}/download-approved`, { method: "POST" });
-    alert("Triggered downloading for approved records. Monitor the log box for progress.");
+    const res = await fetch(`/api/jobs/${currentJobId}/download-approved`, { method: "POST" });
+    if (res.ok) {
+      setTimeout(fetchJobDetails, 600);
+    }
   } catch (err) {
     console.error("Download approved error", err);
+  } finally {
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = "Download Approved Rows";
+      fetchJobDetails();
+    }, 2500);
   }
 });
 

@@ -21,6 +21,7 @@ from app.models import (
 from app.network import NetworkClient
 from app.ollama import OllamaClient
 from app.orchestrator import Orchestrator
+from app.parser import HtmlParser
 
 
 app = FastAPI(title="SmartScraper", description="Local Smart Document Scraper")
@@ -173,6 +174,33 @@ async def get_job_details(job_id: int):
         raise HTTPException(status_code=404, detail="Job not found")
     events = db.get_events(job_id, limit=50)
     records = db.get_records_for_job(job_id)
+
+    # Synchronize stats with actual records and attachments (including manual actions and downloads)
+    if records:
+        job.stats.submissions_found = len(records)
+        job.stats.submissions_selected = sum(
+            1 for r in records if r.decision == DecisionOutcome.SELECT or r.status == "manual_included"
+        )
+        job.stats.submissions_rejected = sum(
+            1 for r in records if (r.decision == DecisionOutcome.REJECT and r.status != "manual_included") or r.status == "manual_excluded"
+        )
+        job.stats.submissions_uncertain = sum(
+            1 for r in records if (r.decision in (DecisionOutcome.UNCERTAIN, DecisionOutcome.NEEDS_DETAIL) and r.status not in ("manual_included", "manual_excluded"))
+        )
+        job.stats.attachments_downloaded = sum(
+            1 for r in records for a in r.attachments if a.download_status == AttachmentStatus.DOWNLOADED
+        )
+        job.stats.attachments_reused = sum(
+            1 for r in records for a in r.attachments if a.download_status == AttachmentStatus.REUSED
+        )
+        job.stats.attachments_failed = sum(
+            1 for r in records for a in r.attachments if a.download_status == AttachmentStatus.FAILED
+        )
+        job.stats.unique_files = len(set(
+            a.sha256 for r in records for a in r.attachments if a.sha256 and a.download_status in (AttachmentStatus.DOWNLOADED, AttachmentStatus.REUSED)
+        ))
+        db.update_job(job)
+
     return {
         "job": job.model_dump(),
         "events": [e.model_dump() for e in events],
@@ -209,6 +237,20 @@ async def record_action(record_id: int, req: RecordActionRequest):
         """, (new_status, new_decision, reason, record_id))
         conn.commit()
 
+    # Recalculate job stats immediately so Job Monitor reflects inclusion/exclusion
+    if job:
+        recs = db.get_records_for_job(job_id)
+        job.stats.submissions_selected = sum(
+            1 for r in recs if r.decision == DecisionOutcome.SELECT or r.status == "manual_included"
+        )
+        job.stats.submissions_rejected = sum(
+            1 for r in recs if (r.decision == DecisionOutcome.REJECT and r.status != "manual_included") or r.status == "manual_excluded"
+        )
+        job.stats.submissions_uncertain = sum(
+            1 for r in recs if (r.decision in (DecisionOutcome.UNCERTAIN, DecisionOutcome.NEEDS_DETAIL) and r.status not in ("manual_included", "manual_excluded"))
+        )
+        db.update_job(job)
+
     db.log_event(job_id, f"Record {row['record_id']} {req.action}d by user", level="info")
     return {"status": "success", "new_status": new_status}
 
@@ -223,14 +265,23 @@ async def download_approved(job_id: int, bg_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="Project not found")
 
     records = db.get_records_for_job(job_id)
-    approved_records = [r for r in records if r.status in ("manual_included", "select")]
+    approved_records = [
+        r for r in records
+        if (r.status in ("manual_included", "select") or r.decision == DecisionOutcome.SELECT) and r.status != "manual_excluded"
+    ]
 
     async def _download_task():
+        cur_job = db.get_job(job_id)
+        if not cur_job:
+            return
+
+        db.log_event(job_id, "Started downloading approved rows", level="info")
         for r in approved_records:
             # If no attachments but detail URL exists, visit detail page first
             if not r.attachments and r.detail_url:
                 try:
                     d_resp = await net_client.fetch(r.detail_url)
+                    cur_job.stats.detail_pages_visited += 1
                     _, d_atts = HtmlParser.parse_generic_detail(d_resp.text, r.detail_url)
                     r.attachments.extend(d_atts)
                     db.save_record(r)
@@ -240,10 +291,39 @@ async def download_approved(job_id: int, bg_tasks: BackgroundTasks):
             for att in r.attachments:
                 if att.download_status not in (AttachmentStatus.DOWNLOADED, AttachmentStatus.REUSED):
                     try:
-                        await downloader.download_attachment(att, project, job_id)
+                        downloaded_att = await downloader.download_attachment(att, project, job_id)
+                        if downloaded_att.is_reused:
+                            cur_job.stats.attachments_reused += 1
+                        elif downloaded_att.download_status == AttachmentStatus.DOWNLOADED:
+                            cur_job.stats.attachments_downloaded += 1
+                            cur_job.stats.unique_files += 1
+                        elif downloaded_att.download_status == AttachmentStatus.FAILED:
+                            cur_job.stats.attachments_failed += 1
                         db.log_event(job_id, f"Downloaded approved file {att.original_name}", level="success")
                     except Exception as e:
+                        cur_job.stats.attachments_failed += 1
                         db.log_event(job_id, f"Failed approved file download {att.original_name}: {e}", level="warning")
+            
+            # Checkpoint job stats after each record
+            db.update_job(cur_job)
+
+        # Update manifests and final stats after completing downloads
+        updated_records = db.get_records_for_job(job_id)
+        downloader.export_manifests(project, cur_job, updated_records)
+        cur_job.stats.attachments_downloaded = sum(
+            1 for r in updated_records for a in r.attachments if a.download_status == AttachmentStatus.DOWNLOADED
+        )
+        cur_job.stats.attachments_reused = sum(
+            1 for r in updated_records for a in r.attachments if a.download_status == AttachmentStatus.REUSED
+        )
+        cur_job.stats.attachments_failed = sum(
+            1 for r in updated_records for a in r.attachments if a.download_status == AttachmentStatus.FAILED
+        )
+        cur_job.stats.unique_files = len(set(
+            a.sha256 for r in updated_records for a in r.attachments if a.sha256 and a.download_status in (AttachmentStatus.DOWNLOADED, AttachmentStatus.REUSED)
+        ))
+        db.update_job(cur_job)
+        db.log_event(job_id, "Completed downloading approved rows", level="success")
 
     bg_tasks.add_task(_download_task)
     return {"status": "downloading_approved"}
