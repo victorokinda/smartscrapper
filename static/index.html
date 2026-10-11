@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SmartScraper - Document Discovery & Classification</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="header-title">
+        <h1>SmartScraper</h1>
+        <p>Local smart document scraper with sequential Qwen &amp; Tev1 Ollama inference</p>
+      </div>
+      <div class="status-badge" id="model-status-badge">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="model-status-text">Ollama: Checking...</span>
+      </div>
+    </header>
+
+    <div class="grid-2">
+      <!-- Project & Configuration Panel -->
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Project Configuration</h2>
+          <span id="output-dir-preview" class="output-path"></span>
+        </div>
+
+        <div class="form-group">
+          <label for="project-select">Saved Project</label>
+          <select id="project-select">
+            <option value="">-- New Project --</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="project-name">Project Name</label>
+          <input type="text" id="project-name" value="CARB SB 253 Comments" placeholder="e.g. CARB SB 253 Comments">
+        </div>
+
+        <div class="form-group">
+          <label for="source-url">Starting URL</label>
+          <input type="text" id="source-url" value="https://ww2.arb.ca.gov/approved-comments?entity_id=41096&page=0">
+        </div>
+
+        <div class="form-group">
+          <label for="instructions">Instructions &amp; Criteria (with optional navigation hints)</label>
+          <textarea id="instructions">Download comment attachments concerning California SB 253 submitted by industry associations; institutional investors and financial coalitions; environmental NGOs; environmental justice and community coalitions; accounting, auditing and professional standards bodies; labor unions and labor coalitions; academic centers; think tanks; and policy clinics. Include joint SB 253/SB 261 submissions when SB 253 is explicitly covered. Exclude submissions concerning SB 261 alone, unrelated proceedings, individuals speaking solely in a personal capacity, and individual commercial companies unless they fall within one of the requested categories. Use subject, submitter information and attachment filenames as evidence. Put cases with insufficient evidence into Review rather than guessing.</textarea>
+        </div>
+
+        <div class="form-group">
+          <label for="classifier-mode">Inference Mode</label>
+          <select id="classifier-mode">
+            <option value="decision">Sequential Target Mode (Qwen 14B Planner &rarr; Tev1 4B Classifier)</option>
+            <option value="qwen">Qwen-Only Baseline Mode (Qwen 14B Planning + Classification)</option>
+          </select>
+        </div>
+
+        <div class="btn-group">
+          <button id="btn-start" class="btn-primary">Start Job</button>
+          <button id="btn-cancel" class="btn-danger" disabled>Cancel</button>
+          <button id="btn-resume" class="btn-secondary" disabled>Resume</button>
+        </div>
+      </div>
+
+      <!-- Execution & Monitor Panel -->
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Job Monitor</h2>
+          <span id="job-stage-badge" class="tag tag-needs_detail">Idle</span>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-value" id="stat-listing-pages">0</div>
+            <div class="stat-label">Listing Pages</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-detail-pages">0</div>
+            <div class="stat-label">Detail Pages</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-found">0</div>
+            <div class="stat-label">Discovered</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-selected" style="color: var(--success);">0</div>
+            <div class="stat-label">Selected</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-rejected" style="color: var(--danger);">0</div>
+            <div class="stat-label">Rejected</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-uncertain" style="color: var(--warning);">0</div>
+            <div class="stat-label">Review / Skipped</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-downloaded" style="color: var(--info);">0</div>
+            <div class="stat-label">Downloaded</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-reused">0</div>
+            <div class="stat-label">Reused Files</div>
+          </div>
+        </div>
+
+        <div id="throttling-indicator" style="display: none; padding: 6px 10px; background: rgba(245, 158, 11, 0.15); border: 1px solid var(--warning); border-radius: 6px; font-size: 0.8rem; margin-bottom: 12px; color: var(--warning);">
+          Rate-limiter throttling active. Next request after cooldown.
+        </div>
+
+        <label>Recent Activity &amp; Logs</label>
+        <div class="log-box" id="log-box">
+          <div class="log-item info">Ready. Configure project and start crawl.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Results Table Panel -->
+    <div class="panel">
+      <div class="panel-header">
+        <h2>Discovered Records &amp; Decisions</h2>
+        <div style="display: flex; gap: 8px;">
+          <a id="btn-export-csv" href="#" class="btn-secondary" style="display: none; text-decoration: none; padding: 6px 12px; border-radius: 6px; font-size: 0.82rem;">Download CSV Manifest</a>
+          <a id="btn-export-json" href="#" class="btn-secondary" style="display: none; text-decoration: none; padding: 6px 12px; border-radius: 6px; font-size: 0.82rem;">Download JSON Manifest</a>
+          <button id="btn-download-approved" class="btn-success" style="display: none; padding: 6px 12px; font-size: 0.82rem;">Download Approved Rows</button>
+        </div>
+      </div>
+
+      <div class="table-controls">
+        <div class="filters-group">
+          <label style="margin: 0;">Filter:</label>
+          <select id="filter-status" style="width: auto; padding: 4px 8px; font-size: 0.82rem;">
+            <option value="all">All Records</option>
+            <option value="select">Selected Only</option>
+            <option value="uncertain">Review / Uncertain Only</option>
+            <option value="reject">Rejected Only</option>
+          </select>
+        </div>
+        <span id="record-count-label" style="font-size: 0.82rem; color: var(--text-muted);">0 records</span>
+      </div>
+
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Submitter</th>
+              <th>Subject / Title</th>
+              <th>Decision</th>
+              <th>Reason &amp; Probabilities</th>
+              <th>Attachments</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="records-tbody">
+            <tr>
+              <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 30px;">
+                No records discovered yet. Start a job to begin crawling and classifying.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
