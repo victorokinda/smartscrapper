@@ -49,7 +49,9 @@ class Settings(BaseSettings):
     MAX_PAGES: int = 500
     MAX_FILE_MB: int = 100
     MAX_DETAIL_DEPTH: int = 1
-    ENABLE_BROWSER_RENDERING: bool = False
+    ENABLE_BROWSER_RENDERING: bool = True
+    PLAYWRIGHT_TIMEOUT_SECONDS: float = 30.0
+    PLAYWRIGHT_HEADLESS: bool = True
 
     @property
     def download_path(self) -> Path:

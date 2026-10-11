@@ -13,6 +13,8 @@ from app.models import (
 from app.network import NetworkClient
 from app.ollama import OllamaClient
 from app.parser import HtmlParser
+from app.fetcher import SmartFetcher
+from app.eu_feedback import EUFeedbackPortal
 
 
 class Orchestrator:
@@ -29,6 +31,7 @@ class Orchestrator:
         self.net = net_client
         self.ollama = ollama_client
         self.downloader = downloader
+        self.fetcher = SmartFetcher(self.net)
         self.active_jobs: Dict[int, asyncio.Task] = {}
         self.cancel_events: Dict[int, asyncio.Event] = {}
 
@@ -115,24 +118,53 @@ class Orchestrator:
                     break
                 visited_pages.add(current_url)
 
-                self.db.log_event(job.id, f"Fetching listing page {page_number}: {current_url}", level="info", event_type="fetch")
-                try:
-                    resp = await self.net.fetch(current_url, cancel_event)
-                except OriginBlockedError as be:
-                    job.status = JobStatus.FAILED
-                    job.error = f"Blocked by origin: {be}"
-                    self.db.log_event(job.id, job.error, level="error", event_type="blocked")
-                    break
-                except Exception as fe:
-                    self.db.log_event(job.id, f"Failed to fetch {current_url}: {fe}", level="error")
-                    break
+                is_eu = EUFeedbackPortal.is_eu_feedback_url(current_url)
+                if is_eu:
+                    self.db.log_event(job.id, f"Detected European Commission consultation portal: {current_url}", level="info", event_type="portal_detected")
+                    try:
+                        records, next_page_url, init_title = await EUFeedbackPortal.fetch_feedbacks(
+                            current_url, self.net, page_number=page_number, cancel_event=cancel_event
+                        )
+                        if init_title and job.rubric and not job.rubric.summary:
+                            job.rubric.summary = f"EU Consultation: {init_title}"
+                        html = ""
+                    except Exception as e:
+                        self.db.log_event(job.id, f"EU feedback API extraction error: {e}. Falling back to general fetcher.", level="warning")
+                        is_eu = False
+
+                if not is_eu:
+                    try:
+                        html, meta = await self.fetcher.fetch_html(current_url, cancel_event=cancel_event)
+                        if meta.get("escalated"):
+                            self.db.log_event(job.id, "Dynamic SPA detected. Escalated page fetch to headless browser.", level="info", event_type="browser_escalation")
+                    except OriginBlockedError as be:
+                        job.status = JobStatus.FAILED
+                        job.error = f"Blocked by origin: {be}"
+                        self.db.log_event(job.id, job.error, level="error", event_type="blocked")
+                        break
+                    except Exception as fe:
+                        self.db.log_event(job.id, f"Failed to fetch {current_url}: {fe}", level="error")
+                        break
+
+                    records, next_page_url = HtmlParser.parse_generic_listing(html, current_url, page_number)
+
+                    # If 0 records were found on starting page, attempt browser escalation if not already tried
+                    if not records and page_number == 0 and not meta.get("escalated") and settings.ENABLE_BROWSER_RENDERING:
+                        self.db.log_event(job.id, "0 records found with static HTTP parser. Escalating to headless browser to inspect dynamic DOM...", level="info", event_type="browser_escalation")
+                        try:
+                            browser_html, b_meta = await self.fetcher.fetch_html(current_url, cancel_event=cancel_event, force_browser=True)
+                            if b_meta.get("escalated"):
+                                html = browser_html
+                                records, next_page_url = HtmlParser.parse_generic_listing(html, current_url, page_number)
+                        except Exception as be:
+                            self.db.log_event(job.id, f"Browser escalation attempt failed: {be}", level="warning")
+
+                    # If still 0 records on starting page, log rich DOM diagnostics
+                    if not records and page_number == 0:
+                        diagnosis = HtmlParser.diagnose_empty_listing(html, current_url)
+                        self.db.log_event(job.id, diagnosis, level="warning", event_type="diagnosis")
 
                 job.stats.listing_pages_visited += 1
-
-                # Parse records from listing page
-                records, next_page_url = HtmlParser.parse_generic_listing(resp.text, current_url, page_number)
-                if not records and page_number == 0:
-                    self.db.log_event(job.id, "No records found on starting listing page. Check selectors or structure.", level="warning")
 
                 for record in records:
                     if cancel_event.is_set():

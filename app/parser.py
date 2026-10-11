@@ -27,7 +27,7 @@ def is_document_url(url: str, text: str = "") -> bool:
         return True
     if any(lower_text.endswith(ext) for ext in doc_exts):
         return True
-    if "system/files" in lower_url or "/download" in lower_url or "/webform/public_comments/" in lower_url:
+    if "system/files" in lower_url or "/download" in lower_url or "/webform/public_comments/" in lower_url or "/attachment" in lower_url:
         return True
     return False
 
@@ -216,22 +216,32 @@ class HtmlParser:
 
         # Generic list / card parsing if no table found
         if not records:
-            candidate_cards = soup.find_all(class_=re.compile(r"card|item|entry|submission-card|comment-card|record-item"))
-            if not candidate_cards:
-                candidate_cards = soup.find_all(class_=re.compile(r"submission|comment|result"))
-            if not candidate_cards:
-                candidate_cards = soup.find_all("article")
+            # Look for card/item elements by class or custom component tag names
+            candidate_cards = soup.find_all(
+                lambda tag: (
+                    tag.name in ("feedback-item", "app-feedback-card", "eui-card", "article") or
+                    (tag.get("class") and any(
+                        re.search(r"card|item|entry|submission|comment|feedback|result|record", c, re.I)
+                        for c in tag.get("class")
+                    ))
+                )
+            )
 
             # Keep only items that are not ancestors of other candidates
             cards = [c for c in candidate_cards if not any(child != c and child in c.descendants for child in candidate_cards)]
             for idx, card in enumerate(cards):
-                h = card.find(["h1", "h2", "h3", "h4", "a"])
+                h = card.find(["h1", "h2", "h3", "h4", "a", "strong", "b"])
                 title = clean_text(h.get_text()) if h else f"Item {idx}"
-                desc = clean_text(card.get_text()[:400])
+                desc = clean_text(card.get_text()[:600])
                 rec_id = f"card_p{page_number}_{idx}"
 
+                # Look for detail URL in card attributes or anchor tags
                 detail_url = None
-                attachments = []
+                card_data_url = card.get("data-url") or card.get("data-href")
+                if card_data_url:
+                    detail_url = urljoin(base_url, card_data_url)
+
+                attachments: List[Attachment] = []
                 for a_idx, a in enumerate(card.find_all("a")):
                     href = a.get("href")
                     if not href:
@@ -245,8 +255,21 @@ class HtmlParser:
                             url=full_href,
                             download_status=AttachmentStatus.PENDING
                         ))
-                    elif not detail_url:
+                    elif not detail_url and not full_href.endswith("#"):
                         detail_url = full_href
+
+                # Also look for elements with download URLs
+                for btn in card.find_all(lambda el: el.name in ("button", "span", "div") and (el.get("data-download-url") or el.get("data-url"))):
+                    d_url = btn.get("data-download-url") or btn.get("data-url")
+                    if d_url:
+                        full_d_url = urljoin(base_url, d_url)
+                        if is_document_url(full_d_url):
+                            attachments.append(Attachment(
+                                attachment_id=f"{rec_id}_att_{len(attachments)}",
+                                original_name=clean_text(btn.get_text()) or full_d_url.split("/")[-1],
+                                url=full_d_url,
+                                download_status=AttachmentStatus.PENDING
+                            ))
 
                 record = Record(
                     record_id=rec_id,
@@ -272,6 +295,51 @@ class HtmlParser:
             next_page_url = urljoin(base_url, next_link["href"])
 
         return records, next_page_url
+
+    @staticmethod
+    def diagnose_empty_listing(html: str, url: str) -> str:
+        if not html:
+            return f"Empty response received from {url} (0 bytes)."
+
+        soup = BeautifulSoup(html[:100000], "html.parser")
+        body = soup.find("body")
+        body_text = clean_text(body.get_text() if body else "")
+        html_len = len(html)
+        text_len = len(body_text)
+
+        # Detect Frameworks / SPA tags
+        detected_tech = []
+        if soup.find("app-root") or "ng-version" in html or "polyfills" in html:
+            detected_tech.append("Angular (<app-root>)")
+        if soup.find(id="root") or "data-reactroot" in html or "react" in html.lower():
+            detected_tech.append("React (#root)")
+        if soup.find(id="app") or "v-cloak" in html or "vue" in html.lower():
+            detected_tech.append("Vue (#app)")
+        if soup.find(id="__next") or "_next/static" in html:
+            detected_tech.append("Next.js (#__next)")
+
+        # Inspect containers
+        containers = []
+        for tag in ["main", "article", "table", "section", "form"]:
+            found = soup.find_all(tag)
+            if found:
+                containers.append(f"<{tag}> ({len(found)})")
+
+        msg = (
+            f"0 records found on {url} (HTML length: {html_len:,} chars, visible text: {text_len:,} chars). "
+        )
+        if detected_tech:
+            msg += (
+                f"Client-side SPA framework detected: {', '.join(detected_tech)}. "
+                "The target site relies on dynamic JavaScript rendering or backend REST API calls. "
+                "Ensure ENABLE_BROWSER_RENDERING is active or target the site's underlying API endpoint directly."
+            )
+        elif containers:
+            msg += f"Discovered standard containers: {', '.join(containers)}, but no table rows or listing card patterns matched."
+        else:
+            msg += "No recognizable tabular or card container elements discovered in DOM."
+
+        return msg.strip()
 
     @staticmethod
     def parse_generic_detail(html: str, base_url: str) -> Tuple[str, List[Attachment]]:
